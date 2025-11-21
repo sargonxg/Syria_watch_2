@@ -53,16 +53,15 @@ DB_PATH = "syria_monitor.db"
 
 class SitRepPDF(FPDF):
     def __init__(self):
-        # Explicitly set A4 and margins immediately to avoid geometry errors
+        # Explicitly set A4 (210x297mm) and margins
         super().__init__(orientation='P', unit='mm', format='A4')
         self.set_margins(10, 10, 10) 
         self.set_auto_page_break(auto=True, margin=15)
-        # Explicit effective width: 210mm (A4) - 10mm (Left) - 10mm (Right) = 190mm
+        # Safe width: 210 - 10 (left) - 10 (right) = 190
         self.epw_safe = 190 
 
     def header(self):
         self.set_font('Helvetica', 'B', 14)
-        # Use explicit width
         self.cell(self.epw_safe, 8, 'Syria Conflict Monitor | Political Affairs Briefing', ln=True, align='C')
         self.ln(2)
         self.set_draw_color(0, 0, 0)
@@ -78,39 +77,31 @@ class SitRepPDF(FPDF):
         self.ln(2)
         self.set_font('Helvetica', 'B', 11)
         self.set_fill_color(240, 240, 240)
-        # Explicit width prevents "no horizontal space" error
         self.cell(self.epw_safe, 8, f"  {label}", fill=True, ln=True, align='L')
         self.ln(2)
 
     def add_article(self, title, source, text):
-        # Title Block
         self.set_font('Helvetica', 'B', 10)
         self.multi_cell(self.epw_safe, 5, f"{title} [{source}]", align='L')
         
-        # Text Block
         self.set_font('Helvetica', '', 9)
         self.multi_cell(self.epw_safe, 5, text, align='L')
         
-        # Separator line
         self.ln(2)
-        current_y = self.get_y()
+        y = self.get_y()
         self.set_draw_color(220, 220, 220)
-        self.line(10, current_y, 200, current_y)
+        self.line(10, y, 200, y)
         self.ln(3)
         self.set_draw_color(0, 0, 0)
 
 def clean_text_for_pdf(text):
-    """
-    Ruthlessly sanitizes text to prevent FPDF layout crashes.
-    Removes non-breaking spaces, newlines, and converts to Latin-1.
-    """
+    """Sanitizes text to prevent FPDF encoding/layout errors."""
     if not text: return ""
     
-    # 1. Replace problematic whitespace (The #1 cause of the error)
-    # \xa0 is non-breaking space. It prevents wrapping, causing the error.
+    # Remove non-breaking spaces and tabs (Crucial for layout safety)
     text = text.replace('\xa0', ' ').replace('\t', ' ').replace('\n', ' ').replace('\r', '')
     
-    # 2. Normalize quotes
+    # Standardize quotes/dashes
     replacements = {
         '\u2018': "'", '\u2019': "'", '\u201c': '"', '\u201d': '"',
         '\u2013': '-', '\u2014': '-', '\u2026': '...'
@@ -118,293 +109,221 @@ def clean_text_for_pdf(text):
     for k, v in replacements.items():
         text = text.replace(k, v)
     
-    # 3. Collapse multiple spaces
+    # Collapse spaces
     text = re.sub(r'\s+', ' ', text).strip()
     
-    # 4. Transliterate/Ignore non-Latin characters (Arabic/Cyrillic will disappear or become ?)
-    # Standard FPDF cannot render Arabic. This ensures the PDF generates successfully.
+    # Force Latin-1 (replace unsupported chars with ?)
     return text.encode('latin-1', 'replace').decode('latin-1')
 
 def generate_sitrep_pdf(df):
-    """
-    Generates a prioritized 2-page PDF.
-    Priority: Political > Ground > Humanitarian.
-    """
+    """Generates a 2-page PDF with strict prioritization."""
     if df.empty: return None
 
-    # 1. Setup Buckets & Priorities
+    # Sort by relevance
     df_sorted = df.sort_values(by='relevance_score', ascending=False).copy()
     
-    # Limit total characters to ~6000 (approx 2 dense pages)
-    CHAR_LIMIT = 6000
+    # Character budget for ~2 pages
+    CHAR_LIMIT = 5500
     current_chars = 0
     used_links = set()
     
-    final_content = {
+    content = {
         "Political Developments": [],
         "Situation on the Ground": [],
         "Humanitarian and Human Rights": []
     }
 
-    def process_item(row):
-        full = row['full_text'] if row['full_text'] and len(str(row['full_text'])) > 200 else row['summary']
-        if not full: full = "No details available."
+    def format_article(row):
+        # Use full text if available, else summary
+        raw = row['full_text'] if row['full_text'] and len(str(row['full_text'])) > 200 else row['summary']
+        if not raw: raw = "No details available."
         
-        # Clean immediately
-        clean_body = clean_text_for_pdf(full)
-        clean_title = clean_text_for_pdf(row['title'])
-        clean_source = clean_text_for_pdf(row['source'])
+        clean_b = clean_text_for_pdf(raw)
+        clean_t = clean_text_for_pdf(row['title'])
+        clean_s = clean_text_for_pdf(row['source'])
         
-        # Cap length for density (max 600 chars per article)
-        if len(clean_body) > 600:
-            clean_body = clean_body[:600].rsplit(' ', 1)[0] + "..."
+        # Density Cap: 550 chars per article max
+        if len(clean_b) > 550:
+            clean_b = clean_b[:550].rsplit(' ', 1)[0] + "..."
             
-        return clean_title, clean_source, clean_body
+        return clean_t, clean_s, clean_b
 
-    # 2. The "Anchor" Phase: Ensure Top 1 from each category is present
-    cats = {
+    # --- PHASE 1: ANCHORS (Top 1 per section) ---
+    keywords = {
         "Political Developments": "Political",
         "Situation on the Ground": "Military/Ground",
         "Humanitarian and Human Rights": "Humanitarian|Human Rights"
     }
     
-    # Temporary helper to find top item
-    for section, keyword in cats.items():
-        matches = df_sorted[df_sorted['tags'].astype(str).str.contains(keyword, regex=True)]
-        if not matches.empty:
-            row = matches.iloc[0]
+    for section, regex in keywords.items():
+        match = df_sorted[df_sorted['tags'].astype(str).str.contains(regex, regex=True)]
+        if not match.empty:
+            row = match.iloc[0]
             if row['link'] not in used_links:
-                t, s, b = process_item(row)
-                final_content[section].append((t, s, b))
+                t, s, b = format_article(row)
+                content[section].append((t, s, b))
                 used_links.add(row['link'])
                 current_chars += len(b) + len(t) + 50
 
-    # 3. The "Fill" Phase: Prioritize Political, then others
-    for index, row in df_sorted.iterrows():
+    # --- PHASE 2: FILL (Prioritize Political) ---
+    for _, row in df_sorted.iterrows():
         if current_chars >= CHAR_LIMIT: break
         if row['link'] in used_links: continue
         
         tags = str(row['tags'])
-        target_section = None
+        target = None
+        if "Political" in tags: target = "Political Developments"
+        elif "Military/Ground" in tags: target = "Situation on the Ground"
+        elif "Humanitarian" in tags or "Human Rights" in tags: target = "Humanitarian and Human Rights"
         
-        if "Political" in tags: target_section = "Political Developments"
-        elif "Military/Ground" in tags: target_section = "Situation on the Ground"
-        elif "Humanitarian" in tags or "Human Rights" in tags: target_section = "Humanitarian and Human Rights"
-        
-        if target_section:
-            # Weighting Logic:
-            # Always add Political.
-            # Add Ground/Humanitarian only if we have space AND Political section has > 1 item
-            allow_add = False
-            if target_section == "Political Developments":
-                allow_add = True
-            elif len(final_content["Political Developments"]) >= 2:
-                allow_add = True
+        if target:
+            # Logic: Always add Political. Add others only if Political has enough depth (>=2 items)
+            allow = False
+            if target == "Political Developments":
+                allow = True
+            elif len(content["Political Developments"]) >= 2:
+                allow = True
             
-            if allow_add:
-                t, s, b = process_item(row)
-                final_content[target_section].append((t, s, b))
+            if allow:
+                t, s, b = format_article(row)
+                content[target].append((t, s, b))
                 used_links.add(row['link'])
                 current_chars += len(b) + len(t) + 50
 
-    # 4. Render PDF
+    # --- RENDER ---
     pdf = SitRepPDF()
     pdf.alias_nb_pages()
     pdf.add_page()
     
     pdf.set_font('Helvetica', '', 9)
-    pdf.cell(0, 5, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')} | Articles Processed: {len(df)}", ln=True)
+    pdf.cell(0, 5, f"Date: {datetime.now().strftime('%d %B %Y')} | Articles Analyzed: {len(df)}", ln=True)
     
-    order = ["Political Developments", "Situation on the Ground", "Humanitarian and Human Rights"]
-    
-    for section in order:
-        items = final_content[section]
-        # Always show section header even if empty, to show structure
+    for section in ["Political Developments", "Situation on the Ground", "Humanitarian and Human Rights"]:
         pdf.add_section_title(section)
-        
+        items = content[section]
         if not items:
             pdf.set_font('Helvetica', 'I', 9)
-            pdf.cell(190, 6, "No significant high-priority updates in this window.", ln=True)
+            pdf.cell(190, 6, "No high-priority events detected.", ln=True)
         else:
-            for (title, source, body) in items:
-                pdf.add_article(title, source, body)
+            for t, s, b in items:
+                pdf.add_article(t, s, b)
                 
-    return pdf.output(dest='S').encode('latin-1')
+    # Return bytes directly (Fixes 'encode' error)
+    return bytes(pdf.output())
 
 # ===============================
-# 3. DATABASE & SCRAPING UTILS
+# 3. DATABASE & SCRAPING
 # ===============================
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS articles (link TEXT PRIMARY KEY, title TEXT, source TEXT, published_date TIMESTAMP, summary TEXT, full_text TEXT, tags TEXT, actors TEXT, relevance_score REAL, red_flags TEXT, fetched_at TIMESTAMP)''')
-    # Migration check
     c.execute("PRAGMA table_info(articles)")
     cols = [r[1] for r in c.fetchall()]
     for col in ["full_text", "relevance_score", "red_flags"]:
-        if col not in cols:
-            c.execute(f"ALTER TABLE articles ADD COLUMN {col} TEXT") # Simplified type
+        if col not in cols: c.execute(f"ALTER TABLE articles ADD COLUMN {col} TEXT")
     conn.commit()
     conn.close()
 
-def fetch_full_text(url):
+def fetch_text(url):
     try:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         resp = requests.get(url, headers=headers, timeout=10)
         if resp.status_code == 200:
             soup = BeautifulSoup(resp.text, 'html.parser')
-            # Try article tag first, else all paragraphs
             container = soup.find('article') or soup
-            paras = container.find_all('p')
-            return "\n\n".join([p.get_text(" ", strip=True) for p in paras])
-    except:
-        return ""
+            return "\n\n".join([p.get_text(" ", strip=True) for p in container.find_all('p')])
+    except: return ""
     return ""
 
-def analyze_content(title, text, source):
+def analyze(title, text):
     txt = (title + " " + text).lower()
-    
-    # Tags
-    tags = []
-    for k, v in TOPIC_KEYWORDS.items():
-        if any(w in txt for w in v): tags.append(k)
+    tags = [k for k, v in TOPIC_KEYWORDS.items() if any(w in txt for w in v)]
     if not tags: tags.append("General")
     
-    # Actors
-    actors = []
-    for k, v in ACTOR_KEYWORDS.items():
-        if any(w in txt for w in v): actors.append(k)
-        
-    # Relevance
+    actors = [k for k, v in ACTOR_KEYWORDS.items() if any(w in txt for w in v)]
+    
     score = 1.0
     if "Political" in tags: score += 1.5
     if "Military/Ground" in tags: score += 1.0
-    if any(x in txt for x in ["president", "minister", "summit", "un sc"]): score += 2.0
-    if any(x in txt for x in ["killed", "massacre"]): score += 1.0
+    if any(x in txt for x in ["president", "un sc", "summit", "killed"]): score += 1.5
     
     return ", ".join(tags), ", ".join(actors), min(5.0, score)
 
-def ingest_feeds(lookback_hrs):
+def ingest(hours):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    cutoff = datetime.now() - timedelta(hours=lookback_hrs)
+    cutoff = datetime.now() - timedelta(hours=hours)
     count = 0
-    
     for s in NEWS_SOURCES:
         try:
             f = feedparser.parse(s['url'])
             for e in f.entries:
-                try:
-                    dt = parser.parse(e.get('published', e.get('updated', str(datetime.now())))).replace(tzinfo=None)
-                except: dt = datetime.now()
-                
+                dt = parser.parse(e.get('published', e.get('updated', str(datetime.now())))).replace(tzinfo=None)
                 if dt < cutoff: continue
-                link = e.get('link', '')
+                
+                link = e.get('link')
                 if not link: continue
                 
-                # Check DB
                 c.execute("SELECT link FROM articles WHERE link=?", (link,))
                 if c.fetchone(): continue
                 
-                # Fetch
-                full = fetch_full_text(link)
-                summary = BeautifulSoup(e.get('summary', ''), 'html.parser').get_text()
+                full = fetch_text(link)
+                summ = BeautifulSoup(e.get('summary', ''), 'html.parser').get_text()
                 title = e.get('title', 'No Title')
-                
-                tags, actors, score = analyze_content(title, full or summary, s['name'])
+                tags, acts, score = analyze(title, full or summ)
                 
                 c.execute("INSERT INTO articles VALUES (?,?,?,?,?,?,?,?,?,?,?)", 
-                          (link, title, s['name'], dt, summary, full, tags, actors, score, "None", datetime.now()))
+                          (link, title, s['name'], dt, summ, full, tags, acts, score, "None", datetime.now()))
                 count += 1
-        except Exception as e:
-            print(f"Failed {s['name']}: {e}")
-            
+        except: pass
     conn.commit()
     conn.close()
     return count
 
-def load_articles(lookback_hrs):
+def load(hours):
     conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query("SELECT * FROM articles WHERE published_date >= ? ORDER BY published_date DESC", 
-                           conn, params=(datetime.now() - timedelta(hours=lookback_hrs),))
+    df = pd.read_sql_query("SELECT * FROM articles WHERE published_date >= ? ORDER BY published_date DESC", conn, params=(datetime.now() - timedelta(hours=hours),))
     conn.close()
     return df
 
 # ===============================
-# 4. STREAMLIT UI
+# 4. UI
 # ===============================
 
 st.set_page_config(page_title="Syria Monitor", layout="wide")
 init_db()
 
 st.title("🇸🇾 Syria Conflict News Monitor")
-st.markdown("Political Affairs Office | Automated SitRep Generator")
+st.markdown("**Political Affairs Office | Automated SitRep Generator**")
 
 with st.sidebar:
-    st.header("Controls")
-    lookback = st.slider("Lookback (Hours)", 24, 168, 72, 24)
+    lookback = st.slider("Window (Hours)", 24, 168, 72, 24)
     if st.button("🔄 Refresh Data"):
-        with st.spinner("Scraping sources... this may take a minute..."):
-            n = ingest_feeds(lookback)
-        st.success(f"Ingested {n} new articles.")
+        with st.spinner("Scraping..."):
+            n = ingest(lookback)
+        st.success(f"Ingested {n} items.")
 
-# Load data once
-df = load_articles(lookback)
+df = load(lookback)
 
-tab1, tab2, tab3 = st.tabs(["📊 Dashboard", "📝 PDF Briefing", "🗄 Data View"])
+tab1, tab2 = st.tabs(["📝 PDF Briefing", "📊 Dashboard"])
 
 with tab1:
+    st.subheader("Generate 2-Page SitRep")
     if not df.empty:
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Total Articles", len(df))
-        c2.metric("Political", len(df[df['tags'].str.contains('Political')]))
-        c3.metric("Military", len(df[df['tags'].str.contains('Military')]))
+        if st.button("📄 Generate PDF"):
+            with st.spinner("Generating..."):
+                try:
+                    pdf_data = generate_sitrep_pdf(df)
+                    st.session_state['pdf'] = pdf_data
+                    st.success("Done!")
+                except Exception as e: st.error(f"Error: {e}")
         
-        st.subheader("Latest High Priority Items")
-        st.dataframe(
-            df[df['relevance_score'] >= 3.0][['published_date', 'title', 'source', 'tags', 'relevance_score']],
-            use_container_width=True,
-            hide_index=True
-        )
-    else:
-        st.info("No data found. Please click 'Refresh Data' in the sidebar.")
+        if 'pdf' in st.session_state:
+            st.download_button("⬇️ Download PDF", st.session_state['pdf'], "SitRep.pdf", "application/pdf")
+    else: st.warning("No data.")
 
 with tab2:
-    st.subheader("Generate 2-Page SitRep")
-    st.markdown("""
-    This tool generates a PDF Situation Report prioritized for the Political Affairs Office:
-    1. **Political Developments** (Highest Priority)
-    2. **Situation on the Ground**
-    3. **Humanitarian Updates**
-    
-    *Note: The generator ensures the document fits ~2 pages.*
-    """)
-    
     if not df.empty:
-        if st.button("📄 Create PDF SitRep"):
-            with st.spinner("Generating PDF..."):
-                try:
-                    pdf_bytes = generate_sitrep_pdf(df)
-                    if pdf_bytes:
-                        st.session_state['sitrep_pdf'] = pdf_bytes
-                        st.success("PDF Generated Successfully!")
-                    else:
-                        st.warning("Not enough data to generate report.")
-                except Exception as e:
-                    st.error(f"Error: {e}")
-        
-        if 'sitrep_pdf' in st.session_state:
-            st.download_button(
-                "⬇️ Download SitRep PDF",
-                data=st.session_state['sitrep_pdf'],
-                file_name=f"Syria_SitRep_{datetime.now().date()}.pdf",
-                mime="application/pdf"
-            )
-    else:
-        st.warning("No data available to generate PDF.")
-
-with tab3:
-    st.subheader("Raw Data")
-    if not df.empty:
-        st.dataframe(df)
+        st.dataframe(df[['published_date','source','tags','relevance_score','title']], use_container_width=True)
